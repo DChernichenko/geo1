@@ -144,20 +144,23 @@ class ImageCanvas(QWidget):
             self._pan_last = ev.pos()
             self.setCursor(Qt.ClosedHandCursor)
             return
-        if ev.button() == Qt.LeftButton:
-            ip = self._widget_to_img(ev.pos())
-            # щелчок левой кнопкой мыши в любом режиме разметки
-            # ("pick"/"mark") порождает событие clicked; координаты
-            # ограничиваются полем изображения
-            if self.mode in ("pick", "mark"):
-                u = max(0.0, min(ip.x(), self._w - 1.0))
-                v = max(0.0, min(ip.y(), self._h - 1.0))
-                self.clicked.emit(u, v)
-            elif self.mode == "rect":
-                self._drag_start_img = ip
-                self._press_pos = ev.pos()
-                self.current_rect = QRectF(ip, ip)
-                self.update()
+        if ev.button() != Qt.LeftButton:
+            return
+        ip = self._widget_to_img(ev.pos())
+        if self.mode in ("pick", "mark"):
+            # щелчок ЛКМ сразу порождает событие clicked (отметка пикселя);
+            # координаты ограничиваются полем изображения. Сброс состояния
+            # перетаскивания гарантирует, что release не создаст дубль.
+            self._drag_start_img = None
+            self._press_pos = None
+            u = max(0.0, min(ip.x(), self._w - 1.0))
+            v = max(0.0, min(ip.y(), self._h - 1.0))
+            self.clicked.emit(u, v)
+        elif self.mode == "rect":
+            self._drag_start_img = ip
+            self._press_pos = ev.pos()
+            self.current_rect = QRectF(ip, ip)
+            self.update()
 
     def mouseMoveEvent(self, ev):
         if self._pan_last is not None:
