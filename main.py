@@ -218,24 +218,33 @@ class ImageCanvas(QWidget):
                         self._w * self._zoom, self._h * self._zoom)
         p.drawPixmap(target, QPixmap.fromImage(self._img), source)
         p.setRenderHint(QPainter.Antialiasing)
-        # маркеры
+        # маркеры: опорные точки — жёлтые полупрозрачные 3x3 пикселя,
+        # оценочные точки (пиксели/углы) — синие полупрозрачные 3x3 пикселя
         for m in self.markers:
             wp = self._img_to_widget(QPointF(m["u"], m["v"]))
-            col = QColor(m.get("color", "red"))
-            pen = QPen(col, 2)
-            p.setPen(pen)
-            p.setBrush(col)
-            r = 5.0
-            p.drawEllipse(wp, r, r)
-            p.drawLine(wp + QPointF(-r - 5, 0), wp + QPointF(-r + 1, 0))
-            p.drawLine(wp + QPointF(r - 1, 0), wp + QPointF(r + 5, 0))
-            p.drawLine(wp + QPointF(0, -r - 5), wp + QPointF(0, -r + 1))
-            p.drawLine(wp + QPointF(0, r - 1), wp + QPointF(0, r + 5))
+            kind = m.get("kind", "cp")
+            base = QColor(m.get("color", "blue" if kind != "cp" else "yellow"))
+            # размер маркера: 3x3 пикселя изображения (в координатах виджета)
+            s = max(3.0, 3.0 * self._zoom)
+            rect = QRectF(wp.x() - s / 2.0, wp.y() - s / 2.0, s, s)
+            fill = QColor(base); fill.setAlpha(140)          # полупрозрачная заливка
+            edge = QColor(base); edge.setAlpha(220)          # контур
+            p.setPen(QPen(edge, 1))
+            p.setBrush(fill)
+            p.drawRect(rect)
+            # тонкие штрихи-указатели вокруг маркера
+            p.setPen(QPen(edge, 1))
+            gap = s / 2.0 + 3.0
+            ext = gap + 4.0
+            p.drawLine(QPointF(wp.x() - ext, wp.y()), QPointF(wp.x() - gap, wp.y()))
+            p.drawLine(QPointF(wp.x() + gap, wp.y()), QPointF(wp.x() + ext, wp.y()))
+            p.drawLine(QPointF(wp.x(), wp.y() - ext), QPointF(wp.x(), wp.y() - gap))
+            p.drawLine(QPointF(wp.x(), wp.y() + gap), QPointF(wp.x(), wp.y() + ext))
             lbl = m.get("label", "")
             if lbl:
                 p.setPen(QColor(255, 255, 160))
                 f = QFont(); f.setPointSize(9); f.setBold(True); p.setFont(f)
-                p.drawText(wp + QPointF(8, -8), str(lbl))
+                p.drawText(wp + QPointF(gap + 5, -gap - 1), str(lbl))
         # текущая рамка
         if self.current_rect is not None:
             pen = QPen(QColor(80, 200, 255), 1.5, Qt.DashLine)
@@ -750,15 +759,17 @@ class MainWindow(QMainWindow):
     def _update_canvas_markers(self):
         ms = []
         for i, p in enumerate(self.control_points):
+            # опорные точки: жёлтый полупрозрачный маркер 3x3 пикселя
             ms.append({"u": p["u"], "v": p["v"], "label": "ОП%d" % (i + 1),
-                       "color": "#2eff2e" if p.get("valid", True) else "#888888"})
+                       "kind": "cp",
+                       "color": "#ffe000" if p.get("valid", True) else "#888888"})
         for j, m in enumerate(self.marked_points):
             res = m.get("result")
+            # оценочные точки: синий полупрозрачный маркер 3x3 пикселя
+            col = "#2060ff" if res else "#70a0d0"
             ms.append({"u": m["u"], "v": m["v"],
                        "label": ("У%d" if m["kind"] == "corner" else "П%d") % (j + 1),
-                       "color": "#ff5050" if res else "#ffb020"})
-            if m.get("rect"):
-                pass
+                       "kind": m["kind"], "color": col})
         self.canvas.set_markers(ms)
 
     # ======================================================================
