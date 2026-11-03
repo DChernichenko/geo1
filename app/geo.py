@@ -235,12 +235,16 @@ def gauss_forward(lat_deg, lon_deg, lon0, a, f, k0=1.0):
              - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * math.sin(2 * lat)
              + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * math.sin(4 * lat)
              - (35 * e2 ** 3 / 3072) * math.sin(6 * lat))
-    x = k0 * (M + N * t / 2 * A ** 2
-              + N * t * (5 - t * t + 9 * eta2 + 4 * eta2 ** 2) / 24 * A ** 4
-              + N * t * (61 - 58 * t * t + t ** 4) / 720 * A ** 6)
-    y = k0 * (N * A
-              + N * (1 - t * t + eta2) / 6 * A ** 3
-              + N * (5 - 18 * t * t + t ** 4 + 14 * eta2 - 58 * eta2 * t * t) / 120 * A ** 5)
+    x = k0 * (M + N * t / 2.0 * A ** 2
+              + N * t * (5 - t * t + 9 * eta2 + 4 * eta2 ** 2) / 24.0 * A ** 4
+              + N * t * (61 - 58 * t * t + t ** 4) / 720.0 * A ** 6)
+    # стандартный ряд Гаусса–Крюгера:
+    # y = k0*N*[ sin(dl)*(cosB + cos^3B/6*(1-t^2+e'^2)*dl^2
+    #                     + cos^5B/120*(5-18t^2+t^4+14e'^2-58e'^2 t^2)*dl^4) ]
+    y = k0 * N * math.sin(dl) * (math.cos(lat)
+          + (math.cos(lat) ** 3) / 6.0 * (1 - t * t + eta2) * dl * dl
+          + (math.cos(lat) ** 5) / 120.0 * (5 - 18 * t * t + t ** 4
+                                            + 14 * eta2 - 58 * eta2 * t * t) * dl ** 4)
     return x, y
 
 
@@ -278,19 +282,19 @@ def gauss_inverse(x, y, lon0, a, f, k0=1.0):
     Cb = ep2 * cos_bf * cos_bf
     Tb = tb * tb
     eta2b = ep2 * cos_bf * cos_bf
-    tf = tb / Nb
-    l = yn / Nb                       # приращение долготы в радианах (малое)
-    # широта: Bf - t/(2 N^2) * y^2 * (...)
-    lat_rad = bf - tb * yn * yn / (2.0 * Nb * Nb) * (
-        1.0 - (5.0 + 3.0 * Tb + 10.0 * Cb - 4.0 * Cb * Cb - 9.0 * eta2b)
+    l = yn / Mc                       # безразмерный аргумент ряда y'/M
+    t2 = Tb
+    # B = Bf - (t/2) * l^2 * (1 - (5+3t^2+C-9e'^2)l^2/12 + ...)
+    lat_rad = bf - tb * l * l / 2.0 * (
+        1.0 - (5.0 + 3.0 * t2 + 10.0 * Cb - 4.0 * Cb * Cb - 9.0 * eta2b)
         * l * l / 12.0
-        + (61.0 + 90.0 * Tb + 298.0 * Cb + 45.0 * Tb * Tb
+        + (61.0 + 90.0 * t2 + 298.0 * Cb + 45.0 * t2 * t2
            - 252.0 * eta2b - 3.0 * Cb * Cb) * l ** 4 / 360.0)
-    # долгота: dl = l / cos Bf * (...)
+    # L = L0 + l/cos(Bf) * (1 - (1+2t^2+C)l^2/6 + ...)
     dl_rad = (l / cos_bf) * (
-        1.0 - (1.0 + 2.0 * Tb + Cb) * l * l / 6.0
-        + (5.0 - 2.0 * Cb + 28.0 * Tb - 3.0 * Cb * Cb
-           + 8.0 * eta2b + 24.0 * Tb * Tb) * l ** 4 / 120.0)
+        1.0 - (1.0 + 2.0 * t2 + Cb) * l * l / 6.0
+        + (5.0 - 2.0 * Cb + 28.0 * t2 - 3.0 * Cb * Cb
+           + 8.0 * eta2b + 24.0 * t2 * t2) * l ** 4 / 120.0)
     return math.degrees(lat_rad), math.degrees(l0_rad + dl_rad)
 
 
@@ -343,9 +347,9 @@ class GeoConverter:
         375000000 (ГГС-традиция). Если префикса нет — возвращает Y как есть
         (ложный восток не добавлялся)."""
         yv = float(y_value)
-        s = str(int(abs(yv)))
-        if len(s) >= 8 and s[:2].isdigit():
-            n = int(s[:2])
+        ay = abs(yv)
+        if 10000000.0 <= ay < 610000000.0:      # Y с префиксом зоны (ГГС)
+            n = int(ay // 10000000.0)
             if 1 <= n <= 60:
                 return yv - (n * 10000000.0 + 5000000.0) * (1 if yv >= 0 else -1)
         return yv
@@ -357,11 +361,13 @@ class GeoConverter:
             return self.sys.to_ecef(c1, c2, h)
         a, f = self.sys.ellps
         if kind == "geodetic":
-            xyz = geodetic_to_ecef(c1, c2, h, a, f)
+            xyz = geodetic_to_ecef(parse_angle(c1), parse_angle(c2),
+                                   float(h), a, f)
         else:
             y = self.strip_zone_prefix(c2)
-            lat, lon = gauss_inverse(c1, y, self.central_meridian, a, f, self.k0)
-            xyz = geodetic_to_ecef(lat, lon, h, a, f)
+            lat, lon = gauss_inverse(float(c1), y, self.central_meridian,
+                                     a, f, self.k0)
+            xyz = geodetic_to_ecef(lat, lon, float(h), a, f)
         return datum_to_wgs84_ecef(self.sys.datum, xyz)
 
     def ecef_to_world(self, xyz):
@@ -375,6 +381,8 @@ class GeoConverter:
             return lat, lon, h
         x, y = gauss_forward(lat, lon, self.central_meridian, a, f, self.k0)
         z = self.zone if self.zone else self.zone_for_lon(lon, self.sys.key == "wgs84_utm")
+        if self.sys.key == "wgs84_utm":
+            return x, 500000.0 + y, h
         return x, z * 10000000.0 + 5000000.0 + y, h
 
     def ensure_zone(self, lon_deg):
@@ -540,19 +548,20 @@ class HomographyEstimator:
         sigma_obs = max(sigma_obs, 1e-6)
 
         # ---- ковариация параметров (линеаризация, free 8 параметров) ----
-        # вес наблюдения = 1/sigma^2; нормальные уравнения: N = sum w_i J_i^T J_i
+        # нормальные уравнения в метровой шкале: N = sum J_i^T W_i J_i,
+        # где J_i = dh_метров/dh_free. Ковариация a = pinv(N) (без a-priori).
         free = [0, 1, 2, 3, 4, 5, 6, 7]
         Cxx = np.zeros((8, 8))
         for i, (u, v) in enumerate(pix):
             un, vn = (u - pm[0]) / ps, (v - pm[1]) / ps
             J, _ = _homography_jacobian(Ah, un, vn)
-            Ji = J[:, free] / ws                      # переход к метровой шкале
+            Ji = J[:, free] * ws                      # переход к метровой шкале
             Cxx += (Ji.T @ Ji) * weights[i]
         try:
             Cxx_inv = np.linalg.pinv(Cxx)
         except np.linalg.LinAlgError:
             Cxx_inv = np.eye(8) * 1e12
-        C_h = Cxx_inv * sigma_obs ** 2                # ковариация h в метрах
+        C_h = Cxx_inv                                 # ковариация h в метрах
 
         model = {
             "Ah": Ah, "pm": pm, "ps": ps, "wm": wm, "ws": ws,
