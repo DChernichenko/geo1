@@ -192,9 +192,10 @@ class ImageCanvas(QWidget):
                        "Откройте изображение\n(Файл → Открыть изображение…)")
             p.end()
             return
-        target = QRectF(self._offs,
-                        QPointF(self._w * self._zoom, self._h * self._zoom))
-        p.drawPixmap(target, QPixmap.fromImage(self._img))
+        source = QRectF(0.0, 0.0, float(self._w), float(self._h))
+        target = QRectF(self._offs.x(), self._offs.y(),
+                        self._w * self._zoom, self._h * self._zoom)
+        p.drawPixmap(target, QPixmap.fromImage(self._img), source)
         p.setRenderHint(QPainter.Antialiasing)
         # маркеры
         for m in self.markers:
@@ -600,15 +601,7 @@ class MainWindow(QMainWindow):
         kind = self.converter.sys.kind
         l1, l2, l3 = self.converter.labels()
         labels = ["u, px", "v, px", l1, l2, l3, "СКО, м", "✓"]
-        for c, txt in enumerate(labels):
-            self.tbl.item(c if False else 0)  # no-op guard
-        hdr = self.tbl.horizontalHeader()
-        from PyQt5.QtCore import QVariant
-        model_hdr = self.tbl.model()
-        if model_hdr is not None:
-            model_hdr.setHeaderData(2, Qt.Horizontal, l1)
-            model_hdr.setHeaderData(3, Qt.Horizontal, l2)
-            model_hdr.setHeaderData(4, Qt.Horizontal, l3)
+        self.tbl.setHorizontalHeaderLabels(labels)
         self.tbl.setRowCount(len(self.control_points))
         for r, p in enumerate(self.control_points):
             cells = [
