@@ -219,83 +219,134 @@ class CustomSystem(SysDef):
 # ---------------------------------------------------------------------------
 # Гаусс–Крюгер
 # ---------------------------------------------------------------------------
+def _merid_arc_coeffs(a, e2):
+    e4, e6 = e2 * e2, e2 ** 3
+    c0 = a * (1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0)
+    c2 = a * (-3.0 * e2 / 8.0 - 3.0 * e4 / 32.0 - 45.0 * e6 / 1024.0)
+    c4 = a * (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0)
+    c6 = a * (-35.0 * e6 / 3072.0)
+    return c0, c2, c4, c6
+
+
+def _merid_arc(B, a, e2):
+    """Дуга меридиана от экватора до широты B (рад), метры."""
+    c0, c2, c4, c6 = _merid_arc_coeffs(a, e2)
+    return (c0 * B + c2 * math.sin(2 * B) + c4 * math.sin(4 * B)
+            + c6 * math.sin(6 * B))
+
+
+def _foot_latitude(xn, a, e2):
+    """Широта основания (footpoint) из X (м) — итерациями (~1e-12 рад)."""
+    c0, c2, c4, c6 = _merid_arc_coeffs(a, e2)
+    B = xn / c0
+    for _ in range(20):
+        newB = (xn - c2 * math.sin(2 * B) - c4 * math.sin(4 * B)
+                - c6 * math.sin(6 * B)) / c0
+        if abs(newB - B) < 1e-15:
+            B = newB
+            break
+        B = newB
+    return B
+
+
 def gauss_forward(lat_deg, lon_deg, lon0, a, f, k0=1.0):
-    """lat,lon (в эллипсоиде даты) -> X(север), Y(восток, без номера зоны)."""
+    """lat,lon (в эллипсоиде датума) -> X(север), Y(восток, без номера зоны), м."""
     e2 = f * (2 - f)
     ep2 = e2 / (1 - e2)
     lat, lon = math.radians(lat_deg), math.radians(lon_deg)
-    l0_rad = math.radians(lon0)
-    dl = lon - l0_rad
+    dl = lon - math.radians(lon0)
     sin_lat, cos_lat = math.sin(lat), math.cos(lat)
     t = math.tan(lat)
     eta2 = ep2 * cos_lat * cos_lat
     N = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
     A = dl * cos_lat
-    M = a * ((1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * lat
-             - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * math.sin(2 * lat)
-             + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * math.sin(4 * lat)
-             - (35 * e2 ** 3 / 3072) * math.sin(6 * lat))
+    M = _merid_arc(lat, a, e2)
     x = k0 * (M + N * t / 2.0 * A ** 2
               + N * t * (5 - t * t + 9 * eta2 + 4 * eta2 ** 2) / 24.0 * A ** 4
               + N * t * (61 - 58 * t * t + t ** 4) / 720.0 * A ** 6)
-    # стандартный ряд Гаусса–Крюгера:
-    # y = k0*N*[ sin(dl)*(cosB + cos^3B/6*(1-t^2+e'^2)*dl^2
-    #                     + cos^5B/120*(5-18t^2+t^4+14e'^2-58e'^2 t^2)*dl^4) ]
-    y = k0 * N * math.sin(dl) * (math.cos(lat)
-          + (math.cos(lat) ** 3) / 6.0 * (1 - t * t + eta2) * dl * dl
-          + (math.cos(lat) ** 5) / 120.0 * (5 - 18 * t * t + t ** 4
-                                            + 14 * eta2 - 58 * eta2 * t * t) * dl ** 4)
+    y = k0 * N * cos_lat * dl * (
+        1.0 + (1 - t * t + eta2) / 6.0 * A ** 2
+        + (5 - 18 * t * t + t ** 4 + 14 * eta2 - 58 * eta2 * t * t) / 120.0 * A ** 4)
     return x, y
 
 
-def _arc_m(B, a, e2):
-    """Дуга меридиана от экватора до широты B (рад)."""
-    return a * ((1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * B
-                - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * math.sin(2 * B)
-                + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * math.sin(4 * B)
-                - (35 * e2 ** 3 / 3072) * math.sin(6 * B))
-
-
-def _foot_latitude(xn, a, e2):
-    """Широта основания (footpoint) из X решением N(B)=xn методом Ньютона (~1e-12 м)."""
-    B = xn / a
-    for _ in range(30):
-        dB = (_arc_m(B, a, e2) - xn) / (a * (1 - e2) /
-                                         (1 - e2 * math.sin(B) ** 2) ** 1.5)
-        B -= dB
-        if abs(dB) < 1e-14:
-            break
-    return B
-
-
 def gauss_inverse(x, y, lon0, a, f, k0=1.0):
-    """X, Y -> lat, lon (градусы). Рядовые обратные формулы Гаусса–Крюгера."""
+    """X, Y (м) -> lat, lon (градусы). Метод Ньютона 2x2 с ЧИСЛЕННЫМ
+    якобианом рядов Гаусса–Крюгера и backtracking; квадратичная
+    сходимость (~5 итераций), устойчив во всей 6-градусной зоне."""
     e2 = f * (2 - f)
-    ep2 = e2 / (1 - e2)
     xn, yn = x / k0, y / k0
-    bf = _foot_latitude(xn, a, e2)
-    sin_bf, cos_bf = math.sin(bf), math.cos(bf)
-    l0_rad = math.radians(lon0)
-    tb = math.tan(bf)
-    Nb = a / math.sqrt(1 - e2 * sin_bf * sin_bf)
-    Mc = a * (1 - e2) / (1 - e2 * sin_bf * sin_bf) ** 1.5
-    Cb = ep2 * cos_bf * cos_bf
-    Tb = tb * tb
-    eta2b = ep2 * cos_bf * cos_bf
-    l = yn / Mc                       # безразмерный аргумент ряда y'/M
-    t2 = Tb
-    # B = Bf - (t/2) * l^2 * (1 - (5+3t^2+C-9e'^2)l^2/12 + ...)
-    lat_rad = bf - tb * l * l / 2.0 * (
-        1.0 - (5.0 + 3.0 * t2 + 10.0 * Cb - 4.0 * Cb * Cb - 9.0 * eta2b)
-        * l * l / 12.0
-        + (61.0 + 90.0 * t2 + 298.0 * Cb + 45.0 * t2 * t2
-           - 252.0 * eta2b - 3.0 * Cb * Cb) * l ** 4 / 360.0)
-    # L = L0 + l/cos(Bf) * (1 - (1+2t^2+C)l^2/6 + ...)
-    dl_rad = (l / cos_bf) * (
-        1.0 - (1.0 + 2.0 * t2 + Cb) * l * l / 6.0
-        + (5.0 - 2.0 * Cb + 28.0 * t2 - 3.0 * Cb * Cb
-           + 8.0 * eta2b + 24.0 * t2 * t2) * l ** 4 / 120.0)
-    return math.degrees(lat_rad), math.degrees(l0_rad + dl_rad)
+    l0r = math.radians(lon0)
+
+    def xy(B, L):
+        sin_l, cos_l = math.sin(B), math.cos(B)
+        dl = L - l0r
+        t = math.tan(B)
+        t2 = t * t
+        eta2 = (e2 / (1 - e2)) * cos_l * cos_l
+        N = a / math.sqrt(1 - e2 * sin_l * sin_l)
+        A = dl * cos_l
+        M = _merid_arc(B, a, e2)
+        xc = M + N * t * (A ** 2 / 2.0
+                          + (5 - t2 + 9 * eta2 + 4 * eta2 ** 2) / 24.0 * A ** 4
+                          + (61 - 58 * t2 + t2 * t2) / 720.0 * A ** 6)
+        yc = N * cos_l * dl * (1.0 + (1 - t2 + eta2) / 6.0 * A ** 2
+                               + (5 - 18 * t2 + t2 * t2 + 14 * eta2
+                                  - 58 * eta2 * t2) / 120.0 * A ** 4)
+        return xc, yc
+
+    # старт: широта основания от X, долгота — из переноса по параллели
+    xmax = _merid_arc(math.radians(89.9), a, e2)
+    if xn >= 0:
+        lat = _foot_latitude(min(xn, xmax), a, e2)
+    else:
+        lat = -_foot_latitude(min(-xn, xmax), a, e2)
+    cos_start = max(abs(math.cos(lat)), 1e-3)
+    lonr = l0r + yn / (a * cos_start)
+    prev_res = None
+    stall = 0
+    for _ in range(30):
+        xc, yc = xy(lat, lonr)
+        fx, fy = xc - xn, yc - yn
+        res = fx * fx + fy * fy
+        if abs(fx) < 1e-7 and abs(fy) < 1e-7:
+            break
+        h = 1e-7
+        xp, yp = xy(lat + h, lonr)
+        xm, ym = xy(lat - h, lonr)
+        xl, yl = xy(lat, lonr + h)
+        xr, yr = xy(lat, lonr - h)
+        J = np.array([[(xp - xm) / (2 * h), (xl - xr) / (2 * h)],
+                      [(yp - ym) / (2 * h), (yl - yr) / (2 * h)]])
+        try:
+            d = np.linalg.solve(J, np.array([-fx, -fy]))
+        except np.linalg.LinAlgError:
+            break
+        # backtracking: шаг должен уменьшать невязку
+        step = 1.0
+        ok = False
+        nlat, nlon = lat, lonr
+        for _t in range(10):
+            clat = max(-math.radians(89.999), min(math.radians(89.999),
+                                                  lat + step * d[0]))
+            clon = lonr + step * d[1]
+            cx, cy = xy(clat, clon)
+            if (cx - xn) ** 2 + (cy - yn) ** 2 < res:
+                nlat, nlon, ok = clat, clon, True
+                break
+            step *= 0.5
+        if not ok:
+            if prev_res is not None and res >= prev_res * (1.0 - 1e-12):
+                stall += 1
+            else:
+                stall = 0
+            if stall >= 2:
+                break
+        else:
+            stall = 0
+        prev_res = res
+        lat, lonr = nlat, nlon
+    return math.degrees(lat), math.degrees(lonr)
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +418,12 @@ class GeoConverter:
             y = self.strip_zone_prefix(c2)
             lat, lon = gauss_inverse(float(c1), y, self.central_meridian,
                                      a, f, self.k0)
+            # если зона не задана — определить по долготе и пересчитать
+            # (стартовый CM мог быть неверным при >3° отклонения)
+            if self.zone is None:
+                self.ensure_zone(lon)
+                lat, lon = gauss_inverse(float(c1), y, self.central_meridian,
+                                         a, f, self.k0)
             xyz = geodetic_to_ecef(lat, lon, float(h), a, f)
         return datum_to_wgs84_ecef(self.sys.datum, xyz)
 
