@@ -50,7 +50,8 @@ HELMERT_TO_WGS84 = {
     "WGS84": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
 }
 
-CONF_K = 1.96          # коэффициент доверительного интервала 95 %
+CONF_K = 1.96          # коэффициент доверительного интервала 95 %, k = 1.96
+SEC2RAD = math.pi / (180.0 * 3600.0)   # 1 секунда дуги в радианах
 
 
 def _helmert_matrix(rx_deg, ry_deg, rz_deg, s_ppm):
@@ -243,16 +244,32 @@ def gauss_forward(lat_deg, lon_deg, lon0, a, f, k0=1.0):
     return x, y
 
 
+def _arc_m(B, a, e2):
+    """Дуга меридиана от экватора до широты B (рад)."""
+    return a * ((1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * B
+                - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * math.sin(2 * B)
+                + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * math.sin(4 * B)
+                - (35 * e2 ** 3 / 3072) * math.sin(6 * B))
+
+
+def _foot_latitude(xn, a, e2):
+    """Широта основания (footpoint) из X решением N(B)=xn методом Ньютона (~1e-12 м)."""
+    B = xn / a
+    for _ in range(30):
+        dB = (_arc_m(B, a, e2) - xn) / (a * (1 - e2) /
+                                         (1 - e2 * math.sin(B) ** 2) ** 1.5)
+        B -= dB
+        if abs(dB) < 1e-14:
+            break
+    return B
+
+
 def gauss_inverse(x, y, lon0, a, f, k0=1.0):
-    """X, Y -> lat, lon (градусы). Стандартные рядовые обратные формулы."""
+    """X, Y -> lat, lon (градусы). Рядовые обратные формулы Гаусса–Крюгера."""
     e2 = f * (2 - f)
     ep2 = e2 / (1 - e2)
     xn, yn = x / k0, y / k0
-    M0 = a * (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256)
-    m = xn / M0
-    bf = (m + (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * math.sin(2 * m)
-          + (45 * e2 ** 2 / 1024 + 15 * e2 ** 3 / 1024) * math.sin(4 * m)
-          + (35 * e2 ** 3 / 3072) * math.sin(6 * m))
+    bf = _foot_latitude(xn, a, e2)
     sin_bf, cos_bf = math.sin(bf), math.cos(bf)
     l0_rad = math.radians(lon0)
     tb = math.tan(bf)
@@ -262,16 +279,19 @@ def gauss_inverse(x, y, lon0, a, f, k0=1.0):
     Tb = tb * tb
     eta2b = ep2 * cos_bf * cos_bf
     tf = tb / Nb
-    l = yn / Nb
-    lat = bf - tf * l * l / 2 * (1 - (5 + 3 * Tb + 10 * Cb - 4 * Cb * Cb - 9 * eta2b)
-                                 * l * l / 12.0
-                                 + (61 + 90 * Tb + 298 * Cb + 45 * Tb * Tb
-                                    - 252 * eta2b - 3 * Cb * Cb) * l ** 4 / 360.0)
-    dl = l / cos_bf * (1 - (1 + 2 * Tb + Cb) * l * l / 6.0
-                       + (5 - 2 * Cb + 28 * Tb - 3 * Cb * Cb
-                          + 8 * eta2b + 24 * Tb * Tb) * l ** 4 / 120.0)
-    # dl — приращение долготы в радианах
-    return math.degrees(lat), math.degrees(l0_rad + dl)
+    l = yn / Nb                       # приращение долготы в радианах (малое)
+    # широта: Bf - t/(2 N^2) * y^2 * (...)
+    lat_rad = bf - tb * yn * yn / (2.0 * Nb * Nb) * (
+        1.0 - (5.0 + 3.0 * Tb + 10.0 * Cb - 4.0 * Cb * Cb - 9.0 * eta2b)
+        * l * l / 12.0
+        + (61.0 + 90.0 * Tb + 298.0 * Cb + 45.0 * Tb * Tb
+           - 252.0 * eta2b - 3.0 * Cb * Cb) * l ** 4 / 360.0)
+    # долгота: dl = l / cos Bf * (...)
+    dl_rad = (l / cos_bf) * (
+        1.0 - (1.0 + 2.0 * Tb + Cb) * l * l / 6.0
+        + (5.0 - 2.0 * Cb + 28.0 * Tb - 3.0 * Cb * Cb
+           + 8.0 * eta2b + 24.0 * Tb * Tb) * l ** 4 / 120.0)
+    return math.degrees(lat_rad), math.degrees(l0_rad + dl_rad)
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +319,9 @@ class GeoConverter:
     # --- параметры зоны ------------------------------------------------
     @property
     def central_meridian(self):
-        z = self.zone if self.zone else 1
-        if self.sys.key == "wgs84_utm":
-            return z * 6 - 183
-        return z * 6 - 3
+        z = self.zone if self.zone else 31
+        # единая конвенция ГГС/UTM: номер зоны N,CM = N*6 - 183
+        return z * 6 - 183
 
     @property
     def k0(self):
@@ -314,17 +333,22 @@ class GeoConverter:
 
     @staticmethod
     def zone_for_lon(lon_deg, utm=False):
-        n = int(math.floor(lon_deg / 6.0)) + 1 if not utm else int(math.floor((lon_deg + 180) / 6.0)) % 60 + 1
+        n = int(math.floor((lon_deg + 180.0) / 6.0)) + 1
+        if utm:
+            n = ((n - 1) % 60) + 1
         return max(1, min(60, n))
 
     def strip_zone_prefix(self, y_value):
-        """Срезает номер зоны (1..60) из Y вида 3762xxxxx (ГГС-традиция)."""
-        s = str(int(abs(y_value)))
+        """Срезает номер зоны (1..60) и ложный восток 5 000 000 м из Y вида
+        375000000 (ГГС-традиция). Если префикса нет — возвращает Y как есть
+        (ложный восток не добавлялся)."""
+        yv = float(y_value)
+        s = str(int(abs(yv)))
         if len(s) >= 8 and s[:2].isdigit():
             n = int(s[:2])
             if 1 <= n <= 60:
-                return y_value - n * 10000000 * (1 if y_value >= 0 else -1)
-        return y_value
+                return yv - (n * 10000000.0 + 5000000.0) * (1 if yv >= 0 else -1)
+        return yv
 
     # --- пересчёты -------------------------------------------------------
     def world_to_ecef(self, c1, c2, h):
@@ -351,7 +375,7 @@ class GeoConverter:
             return lat, lon, h
         x, y = gauss_forward(lat, lon, self.central_meridian, a, f, self.k0)
         z = self.zone if self.zone else self.zone_for_lon(lon, self.sys.key == "wgs84_utm")
-        return x, z * 10000000.0 + y, h
+        return x, z * 10000000.0 + 5000000.0 + y, h
 
     def ensure_zone(self, lon_deg):
         if self.sys.kind == "gauss" and not self.zone:
@@ -516,13 +540,14 @@ class HomographyEstimator:
         sigma_obs = max(sigma_obs, 1e-6)
 
         # ---- ковариация параметров (линеаризация, free 8 параметров) ----
+        # вес наблюдения = 1/sigma^2; нормальные уравнения: N = sum w_i J_i^T J_i
         free = [0, 1, 2, 3, 4, 5, 6, 7]
         Cxx = np.zeros((8, 8))
         for i, (u, v) in enumerate(pix):
             un, vn = (u - pm[0]) / ps, (v - pm[1]) / ps
             J, _ = _homography_jacobian(Ah, un, vn)
             Ji = J[:, free] / ws                      # переход к метровой шкале
-            Cxx += np.outer(Ji, Ji) / weights[i] ** 2
+            Cxx += (Ji.T @ Ji) * weights[i]
         try:
             Cxx_inv = np.linalg.pinv(Cxx)
         except np.linalg.LinAlgError:
