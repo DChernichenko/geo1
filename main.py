@@ -65,6 +65,7 @@ class ImageCanvas(QWidget):
         self.markers = []               # [(u,v,label,color)]
         self.current_rect = None        # рисуемая рамка
         self._dragging = False
+        self._press_pos = None          # экранная точка нажатия ЛКМ (режим rect)
         self._drag_start_img = None     # точка начала рамки (изображение)
         self._pan_last = None
         self.setCursor(Qt.CrossCursor)
@@ -143,14 +144,23 @@ class ImageCanvas(QWidget):
             self._pan_last = ev.pos()
             self.setCursor(Qt.ClosedHandCursor)
             return
-        if ev.button() == Qt.LeftButton:
-            ip = self._widget_to_img(ev.pos())
-            if self.mode == "pick":
-                self.clicked.emit(ip.x(), ip.y())
-            elif self.mode == "rect":
-                self._drag_start_img = ip
-                self.current_rect = QRectF(ip, ip)
-                self.update()
+        if ev.button() != Qt.LeftButton:
+            return
+        ip = self._widget_to_img(ev.pos())
+        if self.mode in ("pick", "mark"):
+            # щелчок ЛКМ сразу порождает событие clicked (отметка пикселя);
+            # координаты ограничиваются полем изображения. Сброс состояния
+            # перетаскивания гарантирует, что release не создаст дубль.
+            self._drag_start_img = None
+            self._press_pos = None
+            u = max(0.0, min(ip.x(), self._w - 1.0))
+            v = max(0.0, min(ip.y(), self._h - 1.0))
+            self.clicked.emit(u, v)
+        elif self.mode == "rect":
+            self._drag_start_img = ip
+            self._press_pos = ev.pos()
+            self.current_rect = QRectF(ip, ip)
+            self.update()
 
     def mouseMoveEvent(self, ev):
         if self._pan_last is not None:
@@ -159,21 +169,35 @@ class ImageCanvas(QWidget):
             self._pan_last = ev.pos()
             self.update()
         elif self._drag_start_img is not None:
-            cur = self._widget_to_img(ev.pos())
-            self.current_rect = QRectF(self._drag_start_img, cur).normalized()
-            self.update()
+            # рамка рисуется только после реального перетаскивания (>3 px),
+            # чтобы одиночный клик не порождал вырожденную зону
+            if (ev.pos() - self._press_pos).manhattanLength() > 3:
+                cur = self._widget_to_img(ev.pos())
+                self.current_rect = QRectF(self._drag_start_img,
+                                           cur).normalized()
+                self.update()
 
     def mouseReleaseEvent(self, ev):
         if self._pan_last is not None:
             self._pan_last = None
             self.setCursor(Qt.ArrowCursor if self.mode == "pan"
                             else Qt.CrossCursor)
-        elif self._drag_start_img is not None and self.current_rect is not None:
+        elif self._drag_start_img is not None:
+            start = self._drag_start_img
             r = self.current_rect
+            dragged = ((ev.pos() - self._press_pos).manhattanLength() > 3
+                       and r is not None
+                       and r.width() >= 3 and r.height() >= 3)
             self._drag_start_img = None
-            if r.width() >= 3 and r.height() >= 3:
+            self._press_pos = None
+            if dragged:
                 self.rectSelected.emit(r.left(), r.top(),
                                        r.right(), r.bottom())
+            else:
+                # простой клик без протяжки — отмечаем пиксель
+                u = max(0.0, min(start.x(), self._w - 1.0))
+                v = max(0.0, min(start.y(), self._h - 1.0))
+                self.clicked.emit(u, v)
             self.current_rect = None
             self.update()
 
@@ -197,24 +221,33 @@ class ImageCanvas(QWidget):
                         self._w * self._zoom, self._h * self._zoom)
         p.drawPixmap(target, QPixmap.fromImage(self._img), source)
         p.setRenderHint(QPainter.Antialiasing)
-        # маркеры
+        # маркеры: опорные точки — жёлтые полупрозрачные 3x3 пикселя,
+        # оценочные точки (пиксели/углы) — синие полупрозрачные 3x3 пикселя
         for m in self.markers:
             wp = self._img_to_widget(QPointF(m["u"], m["v"]))
-            col = QColor(m.get("color", "red"))
-            pen = QPen(col, 2)
-            p.setPen(pen)
-            p.setBrush(col)
-            r = 5.0
-            p.drawEllipse(wp, r, r)
-            p.drawLine(wp + QPointF(-r - 5, 0), wp + QPointF(-r + 1, 0))
-            p.drawLine(wp + QPointF(r - 1, 0), wp + QPointF(r + 5, 0))
-            p.drawLine(wp + QPointF(0, -r - 5), wp + QPointF(0, -r + 1))
-            p.drawLine(wp + QPointF(0, r - 1), wp + QPointF(0, r + 5))
+            kind = m.get("kind", "cp")
+            base = QColor(m.get("color", "blue" if kind != "cp" else "yellow"))
+            # размер маркера: 3x3 пикселя изображения (в координатах виджета)
+            s = max(3.0, 3.0 * self._zoom)
+            rect = QRectF(wp.x() - s / 2.0, wp.y() - s / 2.0, s, s)
+            fill = QColor(base); fill.setAlpha(140)          # полупрозрачная заливка
+            edge = QColor(base); edge.setAlpha(220)          # контур
+            p.setPen(QPen(edge, 1))
+            p.setBrush(fill)
+            p.drawRect(rect)
+            # тонкие штрихи-указатели вокруг маркера
+            p.setPen(QPen(edge, 1))
+            gap = s / 2.0 + 3.0
+            ext = gap + 4.0
+            p.drawLine(QPointF(wp.x() - ext, wp.y()), QPointF(wp.x() - gap, wp.y()))
+            p.drawLine(QPointF(wp.x() + gap, wp.y()), QPointF(wp.x() + ext, wp.y()))
+            p.drawLine(QPointF(wp.x(), wp.y() - ext), QPointF(wp.x(), wp.y() - gap))
+            p.drawLine(QPointF(wp.x(), wp.y() + gap), QPointF(wp.x(), wp.y() + ext))
             lbl = m.get("label", "")
             if lbl:
                 p.setPen(QColor(255, 255, 160))
                 f = QFont(); f.setPointSize(9); f.setBold(True); p.setFont(f)
-                p.drawText(wp + QPointF(8, -8), str(lbl))
+                p.drawText(wp + QPointF(gap + 5, -gap - 1), str(lbl))
         # текущая рамка
         if self.current_rect is not None:
             pen = QPen(QColor(80, 200, 255), 1.5, Qt.DashLine)
@@ -540,27 +573,40 @@ class MainWindow(QMainWindow):
         self.canvas.set_mode({0: "pan", 1: "pick", 2: "rect", 3: "mark"}[idx])
 
     def _canvas_clicked(self, u, v):
+        """Обработка щелчка ЛКМ по изображению (сигнал canvas.clicked).
+
+        Режим "mark" — добавление пикселя для оценки координат;
+        режим "rect" — одиночный клик (без протяжки) также отмечает пиксель;
+        режим "pick" — создание опорной точки.
+        """
         if not self.canvas.has_image():
             return
         w, h = self.canvas.image_size()
         u = max(0.0, min(u, w - 1.0)); v = max(0.0, min(v, h - 1.0))
         mode = self.canvas.mode
-        if mode == "pick":
-            dlg = ControlPointDialog(self.converter, u, v, parent=self)
-            if dlg.exec_() == QDialog.Accepted:
-                try:
-                    vals = dlg.values()
-                except ValueError:
-                    QMessageBox.warning(self, "Ошибка", "Некорректный ввод координат.")
-                    return
-                self.control_points.append(vals)
-                self._sync_table_from_data()
-                self._update_canvas_markers()
-                self.statusBar().showMessage(
-                    "Добавлена опорная точка №%d (%.1f; %.1f)" %
-                    (len(self.control_points), u, v))
-        elif mode == "mark":
+        if mode == "mark":
+            # ключевое исправление: отметка пикселя по щелчку ЛКМ
             self._add_marked_point(u, v, "pixel")
+            return
+        if mode == "rect":
+            # одиночный клик в режиме зоны — отмечаем конкретный пиксель
+            self._add_marked_point(u, v, "pixel")
+            return
+        if mode != "pick":
+            return
+        dlg = ControlPointDialog(self.converter, u, v, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            try:
+                vals = dlg.values()
+            except ValueError:
+                QMessageBox.warning(self, "Ошибка", "Некорректный ввод координат.")
+                return
+            self.control_points.append(vals)
+            self._sync_table_from_data()
+            self._update_canvas_markers()
+            self.statusBar().showMessage(
+                "Добавлена опорная точка №%d (%.1f; %.1f)" %
+                (len(self.control_points), u, v))
 
     def _canvas_rect_selected(self, x0, y0, x1, y1):
         """Режим «Зона + угол»: автодетект угла в рамке."""
@@ -584,9 +630,29 @@ class MainWindow(QMainWindow):
         mp = {"u": u, "v": v, "kind": kind, "rect": rect,
               "corner_strength": strength, "result": None}
         self.marked_points.append(mp)
+        # если модель ещё не рассчитана, но точек достаточно — рассчитать
+        if self.model is None and \
+           len(self._control_ecef_list()) >= self.estimator.MIN_POINTS:
+            try:
+                self.model = self.estimator.fit(self._control_ecef_list())
+                q = self.estimator.quality(self.model)
+                self.txt_quality.setText(
+                    "N=%d  RMSEгориз=%.3f м  χ²/доф=%.2f  σвыс=%.3f м" %
+                    (q["n"], q["rmse_horiz_m"], q["chi2_red"], q["sigma_up_m"]))
+            except Exception:
+                self.model = None
         self._compute_single(mp)
         self._update_canvas_markers()
         self._render_results()
+        res = mp.get("result")
+        if res:
+            self.statusBar().showMessage(
+                "Отмечен пиксель (%.2f; %.2f), координаты оценены." % (u, v))
+        else:
+            self.statusBar().showMessage(
+                "Отмечен пиксель (%.2f; %.2f). Для оценки координат нужно "
+                "не менее %d опорных точек и расчёт модели." %
+                (u, v, self.estimator.MIN_POINTS))
 
     # ======================================================================
     # Таблица опорных точек
@@ -696,15 +762,17 @@ class MainWindow(QMainWindow):
     def _update_canvas_markers(self):
         ms = []
         for i, p in enumerate(self.control_points):
+            # опорные точки: жёлтый полупрозрачный маркер 3x3 пикселя
             ms.append({"u": p["u"], "v": p["v"], "label": "ОП%d" % (i + 1),
-                       "color": "#2eff2e" if p.get("valid", True) else "#888888"})
+                       "kind": "cp",
+                       "color": "#ffe000" if p.get("valid", True) else "#888888"})
         for j, m in enumerate(self.marked_points):
             res = m.get("result")
+            # оценочные точки: синий полупрозрачный маркер 3x3 пикселя
+            col = "#2060ff" if res else "#70a0d0"
             ms.append({"u": m["u"], "v": m["v"],
                        "label": ("У%d" if m["kind"] == "corner" else "П%d") % (j + 1),
-                       "color": "#ff5050" if res else "#ffb020"})
-            if m.get("rect"):
-                pass
+                       "kind": m["kind"], "color": col})
         self.canvas.set_markers(ms)
 
     # ======================================================================
