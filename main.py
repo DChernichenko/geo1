@@ -51,6 +51,7 @@ class ImageCanvas(QWidget):
 
     clicked = pyqtSignal(float, float)            # пиксельные координаты
     rectSelected = pyqtSignal(float, float, float, float)   # x0,y0,x1,y1
+    deleteRequested = pyqtSignal(str, int)        # ("cp"/"marked", индекс)
 
     ZOOM_MIN, ZOOM_MAX = 0.02, 64.0
 
@@ -121,6 +122,27 @@ class ImageCanvas(QWidget):
     def _img_to_widget(self, p):
         return QPointF(p.x() * self._zoom + self._offs.x(),
                        p.y() * self._zoom + self._offs.y())
+
+    def _marker_at(self, widget_pos):
+        """Индекс ближайшего маркера в радиусе ~6 px или None."""
+        best, bestd = None, 6.0
+        for i, m in enumerate(self.markers):
+            wp = self._img_to_widget(QPointF(m["u"], m["v"]))
+            d = (wp - widget_pos).manhattanLength()
+            if d < bestd:
+                best, bestd = i, d
+        return best
+
+    def keyPressEvent(self, ev):
+        """Delete — удалить отмеченную точку под курсором мыши."""
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.markers:
+            idx = self._marker_at(self.mapFromGlobal(ev.globalPos()))
+            if idx is not None:
+                kind = self.markers[idx].get("kind", "cp")
+                self.deleteRequested.emit(
+                    "cp" if kind == "cp" else "marked", idx)
+                return
+        super().keyPressEvent(ev)
 
     # --- события мыши ----------------------------------------------------
     def wheelEvent(self, ev):
@@ -333,9 +355,15 @@ class MainWindow(QMainWindow):
         self.control_points = []          # dicts u,v,c1,c2,h,sigma,valid
         self.marked_points = []           # dicts u,v,kind,rect,corner_strength,result
         self.selected_cp_row = -1
+        self.selected_mp_row = -1
         self.estimator = geo.HomographyEstimator(sigma_pix=0.5)
         self.model = None
         self.custom_system = geo.CustomSystem()
+
+        # состояние изменения проекта
+        self.project_path = None           # путь последнего сохранённого файла
+        self._project_loaded = False       # проект был загружен или сохранён
+        self._project_dirty = False        # есть несохранённые изменения
 
         self._build_ui()
         self._build_actions()
@@ -357,6 +385,7 @@ class MainWindow(QMainWindow):
         self.canvas = ImageCanvas()
         self.canvas.clicked.connect(self._canvas_clicked)
         self.canvas.rectSelected.connect(self._canvas_rect_selected)
+        self.canvas.deleteRequested.connect(self._canvas_delete_requested)
         lv.addWidget(self.canvas, 4)
         hint = QLabel("Режим: выберите инструмент на панели сверху. "
                       "Колесо — масштаб, перетаскивание средней кнопкой/Alt — панорама.")
@@ -416,6 +445,29 @@ class MainWindow(QMainWindow):
             row.addWidget(b)
         cv.addLayout(row)
         rv.addWidget(gb_cp, 3)
+
+        # отмеченные пиксели / углы (оценка координат)
+        gb_mp = QGroupBox("Отмеченные точки (оценка координат)")
+        mv2 = QVBoxLayout(gb_mp)
+        self.tbl_mp = QTableWidget(0, 7)
+        self.tbl_mp.setHorizontalHeaderLabels(
+            ["№", "тип", "u, px", "v, px", "C1", "C2", "H, м"])
+        self.tbl_mp.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_mp.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl_mp.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tbl_mp.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_mp.itemSelectionChanged.connect(self._table_mp_sel_changed)
+        mv2.addWidget(self.tbl_mp, 2)
+        row2 = QHBoxLayout()
+        self.btn_del_mp = QPushButton("Удалить")
+        self.btn_recalc_mp = QPushButton("Пересчитать")
+        self.btn_del_mp.clicked.connect(self._delete_marked_point)
+        self.btn_recalc_mp.clicked.connect(self._recompute_all_marked)
+        row2.addWidget(self.btn_del_mp)
+        row2.addWidget(self.btn_recalc_mp)
+        row2.addStretch(1)
+        mv2.addLayout(row2)
+        rv.addWidget(gb_mp, 2)
 
         # режимы разметки
         gb_mode = QGroupBox("Инструменты")
@@ -491,6 +543,36 @@ class MainWindow(QMainWindow):
         tb.addAction(zoom_in); tb.addAction(zoom_out); tb.addAction(zoom_fit)
 
     # ======================================================================
+    # Dirty tracking & close
+    # ======================================================================
+    def _mark_dirty(self):
+        """Пометить проект как имеющий несохранённые изменения."""
+        if not self._project_dirty:
+            self._project_dirty = True
+            self._update_window_title()
+
+    def _update_window_title(self):
+        base = "Оценка координат по изображению с БПЛА"
+        parts = [base]
+        if self.image_path:
+            parts.append("— " + os.path.basename(self.image_path))
+        if self._project_dirty:
+            parts.append("*")
+        self.setWindowTitle(" ".join(parts))
+
+    def closeEvent(self, ev):
+        """При закрытии — предложить сохранить, если есть несохранённые изменения."""
+        if self._project_loaded and self._project_dirty:
+            r = QMessageBox.question(
+                self, "Сохранить проект",
+                "Проект был изменён. Сохранить изменения?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes)
+            if r == QMessageBox.Yes:
+                self._save_project()
+        ev.accept()
+
+    # ======================================================================
     # Конвертер активной системы
     # ======================================================================
     def _current_sys_key(self):
@@ -525,9 +607,18 @@ class MainWindow(QMainWindow):
 
     def _system_changed(self, *_):
         self._refresh_converter()
+        # заголовки и значения в таблицах зависят от активной системы
+        if hasattr(self, "tbl_mp"):
+            self._sync_table_from_data()
+            self._sync_marked_table()
+        self._mark_dirty()
 
     def _params_changed(self, *_):
         self._refresh_converter()
+        if hasattr(self, "tbl_mp"):
+            self._sync_table_from_data()
+            self._sync_marked_table()
+        self._mark_dirty()
 
     # ======================================================================
     # Изображение
@@ -604,6 +695,7 @@ class MainWindow(QMainWindow):
             self.control_points.append(vals)
             self._sync_table_from_data()
             self._update_canvas_markers()
+            self._mark_dirty()
             self.statusBar().showMessage(
                 "Добавлена опорная точка №%d (%.1f; %.1f)" %
                 (len(self.control_points), u, v))
@@ -617,7 +709,8 @@ class MainWindow(QMainWindow):
         try:
             cx, cy, R = detect_corner(gray, (x0, y0, x1, y1))
             strength = float(R)
-        except Exception:
+        except Exception as ex:
+            print("corner detection failed:", ex)
             cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         self.lbl_zone.setText(
             "Зона (%.0f, %.0f)–(%.0f, %.0f); угол: (%.2f; %.2f)%s" %
@@ -630,6 +723,7 @@ class MainWindow(QMainWindow):
         mp = {"u": u, "v": v, "kind": kind, "rect": rect,
               "corner_strength": strength, "result": None}
         self.marked_points.append(mp)
+        self._mark_dirty()
         # если модель ещё не рассчитана, но точек достаточно — рассчитать
         if self.model is None and \
            len(self._control_ecef_list()) >= self.estimator.MIN_POINTS:
@@ -639,10 +733,12 @@ class MainWindow(QMainWindow):
                 self.txt_quality.setText(
                     "N=%d  RMSEгориз=%.3f м  χ²/доф=%.2f  σвыс=%.3f м" %
                     (q["n"], q["rmse_horiz_m"], q["chi2_red"], q["sigma_up_m"]))
-            except Exception:
+            except Exception as ex:
+                print("model fit failed:", ex)
                 self.model = None
         self._compute_single(mp)
         self._update_canvas_markers()
+        self._sync_marked_table()
         self._render_results()
         res = mp.get("result")
         if res:
@@ -714,6 +810,7 @@ class MainWindow(QMainWindow):
         keys = ["u", "v", "c1", "c2", "h", "sigma"]
         self.control_points[row][keys[col]] = val
         self._update_canvas_markers()
+        self._mark_dirty()
 
     def _table_sel_changed(self):
         rows = {i.row() for i in self.tbl.selectedItems()}
@@ -732,6 +829,7 @@ class MainWindow(QMainWindow):
                 return
             self._sync_table_from_data()
             self._update_canvas_markers()
+            self._mark_dirty()
 
     def _delete_cp(self):
         if self.selected_cp_row < 0:
@@ -741,6 +839,7 @@ class MainWindow(QMainWindow):
         self.selected_cp_row = -1
         self._sync_table_from_data()
         self._update_canvas_markers()
+        self._mark_dirty()
 
     def _edit_selected_cp(self):
         if self.selected_cp_row < 0:
@@ -755,6 +854,137 @@ class MainWindow(QMainWindow):
                 return
             self._sync_table_from_data()
             self._update_canvas_markers()
+            self._mark_dirty()
+
+    # ======================================================================
+    # Таблица отмеченных точек (пиксели/углы с оценкой координат)
+    # ======================================================================
+    def _sync_marked_table(self):
+        """Обновляет таблицу отмеченных точек: пиксельные и расчётные
+        координаты, ДИ 95 % (аналогично таблице опорных точек)."""
+        self.tbl_mp.blockSignals(True)
+        kind = self.converter.sys.kind
+        l1, l2, l3 = self.converter.labels()
+        if kind == "geodetic":
+            hdr = ["№", "тип", "u, px", "v, px", l1 + " (+ДИ)",
+                   l2 + " (+ДИ)", l3 + ", м (+ДИ)"]
+        else:
+            hdr = ["№", "тип", "u, px", "v, px",
+                   l1 + ", м (+ДИ)", l2 + ", м (+ДИ)", l3 + ", м (+ДИ)"]
+        self.tbl_mp.setColumnCount(len(hdr))
+        self.tbl_mp.setHorizontalHeaderLabels(hdr)
+        self.tbl_mp.setRowCount(len(self.marked_points))
+        for r, m in enumerate(self.marked_points):
+            tag = ("Угол" if m["kind"] == "corner" else "Пиксель")
+            strength = m.get("corner_strength")
+            if strength is not None:
+                tag += " (%.3g)" % strength
+            res = m.get("result")
+            cells = [("%d" % (r + 1)), tag, "%.3f" % m["u"], "%.3f" % m["v"]]
+            if res:
+                w = res["world"]
+                if kind == "geodetic":
+                    cl = res["ci_latlon_m"]
+                    cells += [
+                        "%s  ±%.1f″" % (geo.format_dms(w[0], True), cl[0]),
+                        "%s  ±%.1f″" % (geo.format_dms(w[1], False), cl[1]),
+                        "%.3f  ±%.3f" % (w[2], cl[2]),
+                    ]
+                else:
+                    cw = res["ci_world"]
+                    cells += [
+                        "%.3f  ±%.3f" % (w[0], cw[0]),
+                        "%.3f  ±%.3f" % (w[1], cw[1]),
+                        "%.3f  ±%.3f" % (w[2], cw[2]),
+                    ]
+            else:
+                cells += ["—", "—", "—"]
+            for c, txt in enumerate(cells):
+                it = QTableWidgetItem(txt)
+                if res and c >= 4:
+                    it.setForeground(QColor("#2060ff"))
+                self.tbl_mp.setItem(r, c, it)
+        self.tbl_mp.blockSignals(False)
+
+    def _table_mp_sel_changed(self):
+        rows = {i.row() for i in self.tbl_mp.selectedItems()}
+        self.selected_mp_row = min(rows) if rows else -1
+
+    def _delete_marked_point(self):
+        """Удаление выбранной отмеченной точки (пикселя/угла)."""
+        if self.selected_mp_row < 0 or \
+           self.selected_mp_row >= len(self.marked_points):
+            QMessageBox.information(self, "Удаление",
+                                    "Выберите строку в таблице "
+                                    "«Отмеченные точки».")
+            return
+        idx = self.selected_mp_row
+        removed = self.marked_points[idx]
+        del self.marked_points[idx]
+        self.selected_mp_row = -1
+        self._update_canvas_markers()
+        self._sync_marked_table()
+        self._render_results()
+        self._mark_dirty()
+        self.statusBar().showMessage(
+            "Удалена отмеченная точка (%.2f; %.2f)." %
+            (removed["u"], removed["v"]))
+
+    def _remove_marked_by_index(self, idx):
+        """Удаление отмеченной точки по её индексу (например, клавишей Delete
+        на холсте)."""
+        if not (0 <= idx < len(self.marked_points)):
+            return
+        removed = self.marked_points[idx]
+        del self.marked_points[idx]
+        if self.selected_mp_row == idx:
+            self.selected_mp_row = -1
+        self._update_canvas_markers()
+        self._sync_marked_table()
+        self._render_results()
+        self._mark_dirty()
+        self.statusBar().showMessage(
+            "Удалена отмеченная точка (%.2f; %.2f)." %
+            (removed["u"], removed["v"]))
+
+    def _canvas_delete_requested(self, what, idx):
+        """Delete на холсте над маркером: удаляет опорную или отмеченную точку."""
+        if what == "marked":
+            self._remove_marked_by_index(idx)
+        elif what == "cp" and 0 <= idx < len(self.control_points):
+            del self.control_points[idx]
+            self.selected_cp_row = -1
+            self._sync_table_from_data()
+            self._update_canvas_markers()
+            self._mark_dirty()
+            self.statusBar().showMessage("Удалена опорная точка №%d." %
+                                         (idx + 1))
+
+    def _recompute_all_marked(self):
+        """Пересчёт координат всех отмеченных точек по текущей модели."""
+        if self.model is None:
+            pts = self._control_ecef_list()
+            if len(pts) < self.estimator.MIN_POINTS:
+                QMessageBox.warning(
+                    self, "Мало точек",
+                    "Нужно не менее %d активных опорных точек." %
+                    self.estimator.MIN_POINTS)
+                return
+            try:
+                self.model = self.estimator.fit(pts)
+            except Exception as ex:
+                print("model fit failed:", ex)
+                QMessageBox.critical(self, "Ошибка оценки", str(ex))
+                return
+        for m in self.marked_points:
+            self._compute_single(m)
+        self._update_canvas_markers()
+        self._sync_marked_table()
+        self._render_results()
+        self._mark_dirty()
+        self.statusBar().showMessage(
+            "Пересчитаны координаты %d отмеченных точек." %
+            len(self.marked_points))
 
     # ======================================================================
     # Маркеры на холсте
@@ -785,7 +1015,9 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 ecef = self.converter.world_to_ecef(p["c1"], p["c2"], p["h"])
-            except Exception:
+            except Exception as ex:
+                print("GCP #%d skipped (world_to_ecef): %s" %
+                      (self.control_points.index(p) + 1, ex))
                 continue
             pts.append({"u": p["u"], "v": p["v"], "ecef": ecef,
                         "sigma_obj": p.get("sigma", 0.5), "valid": True})
@@ -818,7 +1050,9 @@ class MainWindow(QMainWindow):
         for m in self.marked_points:
             self._compute_single(m)
         self._update_canvas_markers()
+        self._sync_marked_table()
         self._render_results()
+        self._mark_dirty()
         self.statusBar().showMessage("Модель рассчитана.")
 
     def _compute_single(self, mp):
@@ -831,7 +1065,6 @@ class MainWindow(QMainWindow):
             lat, lon, h = geo.ecef_to_geodetic(xyz)
             world = self.converter.ecef_to_world(xyz)
             ci_diag = 1.96 * np.sqrt(np.clip(np.diag(cov), 0, None))
-            # ДИ в широту/долготу (секунды дуги) и высоту (м)
             a_axis = geo.WGS84_A
             e2 = geo.WGS84_F * (2 - geo.WGS84_F)
             sl = math.sin(math.radians(lat))
@@ -849,7 +1082,9 @@ class MainWindow(QMainWindow):
                 "ci_world": [float(x) for x in ci_diag],
                 "ci_latlon_m": [float(x) for x in ci_latlon],
             }
-        except Exception:
+            self._mark_dirty()
+        except Exception as ex:
+            print("coordinate computation failed:", ex)
             mp["result"] = None
 
     def _render_results(self):
@@ -919,6 +1154,9 @@ class MainWindow(QMainWindow):
                              self._current_sys_key(), zone, scale,
                              self.ed_epsg.text().strip() or None,
                              self.control_points, self.marked_points)
+        self._project_dirty = False
+        self._project_loaded = True
+        self._update_window_title()
         self.statusBar().showMessage("Проект сохранён: " + self.project_path)
 
     def _open_project(self):
@@ -951,7 +1189,12 @@ class MainWindow(QMainWindow):
         self.control_points = data["control_points"]
         self.marked_points = data["marked_points"]
         self.project_path = path
+        self._project_loaded = True
+        self._project_dirty = False
+        self.selected_cp_row = -1
+        self.selected_mp_row = -1
         self._sync_table_from_data()
+        self._sync_marked_table()
         self._update_canvas_markers()
         if len(self._control_ecef_list()) >= self.estimator.MIN_POINTS:
             self._compute()
